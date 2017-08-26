@@ -1,17 +1,22 @@
 // mqttd, Copyright (c) 2017 Tuomas Starck
+/* TODO
+ *  db filename as cli arg
+ *  refactor sql to another file
+ *  should erroneous hfp message be saved?
+ */
 
 package main
 
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	/// "fmt"
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	_ "github.com/mattn/go-sqlite3"
@@ -19,13 +24,20 @@ import (
 
 type Counter uint64
 
+type QueueMsg struct {
+	at    time.Time
+	qos   int
+	topic string
+	data  string
+}
+
 type HFPMsg struct {
 	VP struct {
 		Desi       string  // "I",
 		Dir        string  // "1",
 		Oper       string  // "-",
 		Veh        string  // "H9091",
-		Tst        string  // "2017-08-20T10:22:40.000Z", (maybe use time.Time)
+		Tst        string  // "2017-08-20T10:22:40.000Z"
 		Tsi        uint64  // 1503224560,
 		Spd        float64 // 0,
 		Lat        float64 // 60.271046,
@@ -42,32 +54,23 @@ type HFPMsg struct {
 
 const databaseFilename = "./hfp.sqlite"
 
-const sqlInsert = `INSERT OR IGNORE INTO hfp VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+const sqlInsert = `INSERT INTO hfp VALUES (?, ?, ?, ?)`
 
 const sqlCreateTable = `CREATE TABLE IF NOT EXISTS hfp (
-desi        text,
-dir         text,
-oper        text,
-veh         text,
-tst         text,
-tsi         integer,
-spd         float,
-lat         float,
-long        float,
-odo         float,
-oday        text,
-jrn         text,
-line        text,
-start       text,
-stop_index  integer,
-source      text
-)`
+	at    integer,
+	qos   integer,
+	topic text,
+	data  text)`
 
 var db *sql.DB
+var insert *sql.Stmt
 var messageCounter Counter
+var writeBuffer chan QueueMsg
 
 func init() {
 	log.SetFlags(log.Lshortfile)
+
+	writeBuffer = make(chan QueueMsg, 8192)
 
 	signalChannel := make(chan os.Signal, 1)
 	signal.Notify(signalChannel, syscall.SIGHUP)
@@ -80,6 +83,7 @@ func init() {
 	}()
 
 	sqliteOpenAndCreate()
+	writeWaitLoop()
 }
 
 func (c *Counter) value() uint64 {
@@ -111,38 +115,42 @@ func sqliteClose() {
 	log.Println("Database closed")
 }
 
-func save(topic string, msg HFPMsg) {
-	db, err := sql.Open("sqlite3", databaseFilename)
+func sqliteBufferWrite() {
+	transaction, err := db.Begin()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer transaction.Rollback()
 
-	query, err := db.Prepare(sqlInsert)
+	statement, err := transaction.Prepare(sqlInsert)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer statement.Close()
 
-	_, err = query.Exec(
-		msg.VP.Desi,
-		msg.VP.Dir,
-		msg.VP.Oper,
-		msg.VP.Veh,
-		msg.VP.Tst,
-		msg.VP.Tsi,
-		msg.VP.Spd,
-		msg.VP.Lat,
-		msg.VP.Long,
-		msg.VP.Odo,
-		msg.VP.Oday,
-		msg.VP.Jrn,
-		msg.VP.Line,
-		msg.VP.Start,
-		msg.VP.Stop_Index,
-		msg.VP.Source,
-	)
+loop:
+	for {
+		select {
+		case msg := <-writeBuffer:
+			_, err = statement.Exec(msg.at, msg.qos, msg.topic, msg.data)
+			if err != nil {
+				log.Fatal(err)
+			}
+		default:
+			break loop
+		}
+	}
+
+	err = transaction.Commit()
 	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+func writeWaitLoop() {
+	defer time.AfterFunc(1000*time.Millisecond, writeWaitLoop)
+	if len(writeBuffer) >= 100 {
+		sqliteBufferWrite()
 	}
 }
 
@@ -150,18 +158,24 @@ func messageHandler(c paho.Client, msg paho.Message) {
 	var hfp HFPMsg
 
 	if err := json.Unmarshal(msg.Payload(), &hfp); err != nil {
-		log.Println(err)
 		log.Println(msg.Topic())
 		log.Println(string(msg.Payload()))
+		log.Println(err)
 	}
 
+	writeBuffer <- QueueMsg{
+		at:    time.Now(),
+		qos:   int(msg.Qos()),
+		topic: msg.Topic(),
+		data:  string(msg.Payload())}
+
 	messageCounter.increment()
-	save(msg.Topic(), hfp)
+
 	/// fmt.Print(".")
-	fmt.Println("<<<")
-	log.Printf("%+v\n", msg.Topic())
-	log.Printf("%+v\n", hfp.VP)
-	fmt.Println(">>>")
+	/// fmt.Println("<<<")
+	/// log.Printf("%+v\n", msg.Topic())
+	/// log.Printf("%+v\n", hfp.VP)
+	/// fmt.Println(">>>")
 }
 
 func connLostHandler(c paho.Client, e error) {
@@ -181,18 +195,15 @@ func onConnectHandler(c paho.Client) {
 func main() {
 	defer sqliteClose()
 
-	/// const TOPIC = "/hfp/#"
-	const TOPIC = "/hfp/journey/rail/#"
-	/// const TOPIC = "/hfp/journey/tram/0040_00409/#"
+	const TOPIC = "/hfp/#"
+	/// "/hfp/journey/rail/#"
+	/// "/hfp/journey/tram/0040_00409/#"
 
 	opts := paho.NewClientOptions()
 	opts = opts.SetConnectionLostHandler(connLostHandler)
 	opts = opts.SetDefaultPublishHandler(defPublishHandler)
 	opts = opts.SetOnConnectHandler(onConnectHandler)
 	opts = opts.AddBroker("tcp://mqtt.hsl.fi:1883")
-	/// opts = opts.SetKeepAlive(30 * time.Second)
-	/// opts = opts.SetPingTimeout(10 * time.Second)
-	/// opts = opts.SetWriteTimeout(30 * time.Second)
 	client := paho.NewClient(opts)
 
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
@@ -200,15 +211,11 @@ func main() {
 		log.Println(token.Error())
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
 	token := client.Subscribe(TOPIC, 0, messageHandler)
 	if token.Wait() && token.Error() != nil {
 		log.Println("Token error")
 		log.Println(token.Error())
 	}
 
-	wg.Wait()
-	os.Exit(0)
+	select {}
 }
