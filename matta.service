@@ -1,0 +1,13 @@
+[Unit]
+Description=MQTT stream collector
+After=network.target rsyslog.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/matta.sh
+KillMode=process
+Restart=on-failure
+StandardOutput=syslog
+
+[Install]
+WantedBy=multi-user.target

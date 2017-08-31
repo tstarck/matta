@@ -1,4 +1,4 @@
-// mqttd, Copyright (c) 2017 Tuomas Starck
+// matta, Copyright (c) 2017 Tuomas Starck
 /* TODO
  *  refactor sql to another file
  *  should erroneous hfp message be saved?
