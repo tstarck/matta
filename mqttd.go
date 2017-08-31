@@ -1,8 +1,14 @@
 // mqttd, Copyright (c) 2017 Tuomas Starck
 /* TODO
- *  db filename as cli arg
  *  refactor sql to another file
  *  should erroneous hfp message be saved?
+ *  method to report write interval
+ *  method to report messages per write
+ *  count how many msgs/sec we get at the moment
+ *
+ *  tcp://mqtt.hsl.fi:1883
+ *  "/hfp/journey/rail/#"
+ *  "/hfp/journey/tram/0040_00409/#"
  */
 
 package main
@@ -10,7 +16,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	/// "fmt"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -23,6 +29,17 @@ import (
 )
 
 type Counter uint64
+
+type Exit struct{ Code int }
+
+type Config struct {
+	debug       bool
+	broker_conn string
+	mqtt_topic  string
+	db_filename string
+	chunk_size  uint
+	verbose     bool
+}
 
 type QueueMsg struct {
 	at    time.Time
@@ -52,9 +69,16 @@ type HFPMsg struct {
 	}
 }
 
-const databaseFilename = "./hfp.sqlite"
+const (
+	usageDebug      = "Print out all debug messages"
+	usageBrokerConn = "MQTT broker connection string as \"proto://host:port\""
+	usageMqttTopic  = "MQTT topic to follow to"
+	usageDbFilename = "Name of the database file"
+	usageChunkSize  = "Minimum number of messages in one write transaction"
+	usageVerbose    = "Verbose output"
 
-const sqlInsert = `INSERT INTO hfp VALUES (?, ?, ?, ?)`
+	sqlInsert = `INSERT INTO hfp VALUES (?, ?, ?, ?)`
+)
 
 const sqlCreateTable = `CREATE TABLE IF NOT EXISTS hfp (
 	at    integer,
@@ -62,29 +86,11 @@ const sqlCreateTable = `CREATE TABLE IF NOT EXISTS hfp (
 	topic text,
 	data  text)`
 
+var conf Config
 var db *sql.DB
 var insert *sql.Stmt
 var messageCounter Counter
 var writeBuffer chan QueueMsg
-
-func init() {
-	log.SetFlags(log.Lshortfile)
-
-	writeBuffer = make(chan QueueMsg, 8192)
-
-	signalChannel := make(chan os.Signal, 1)
-	signal.Notify(signalChannel, syscall.SIGHUP)
-
-	go func() {
-		for {
-			<-signalChannel
-			log.Printf("Messages since start: %d\n", messageCounter.value())
-		}
-	}()
-
-	sqliteOpenAndCreate()
-	writeWaitLoop()
-}
 
 func (c *Counter) value() uint64 {
 	return atomic.LoadUint64((*uint64)(c))
@@ -94,9 +100,50 @@ func (c *Counter) increment() uint64 {
 	return atomic.AddUint64((*uint64)(c), 1)
 }
 
-func sqliteOpenAndCreate() {
+func init() {
+	log.SetFlags(log.Lshortfile)
+
+	conf = parseArguments()
+
+	writeBuffer = make(chan QueueMsg, 8192)
+
+	hupChannel := make(chan os.Signal, 1)
+	signal.Notify(hupChannel, syscall.SIGHUP)
+
+	go func() {
+		for {
+			<-hupChannel
+			log.Printf("Messages since start: %d\n", messageCounter.value())
+		}
+	}()
+
+	sqliteOpenAndCreate(conf.db_filename)
+	writeWaitLoop()
+}
+
+func parseArguments() Config {
+	ptrDebug := flag.Bool("D", false, usageDebug)
+	ptrBrokerConn := flag.String("c", "", usageBrokerConn)
+	ptrMqttTopic := flag.String("t", "", usageMqttTopic)
+	ptrDbFilename := flag.String("f", "hfp.sqlite", usageDbFilename)
+	ptrChunkSize := flag.Uint("s", 1024, usageChunkSize)
+	ptrVerbose := flag.Bool("v", false, usageVerbose)
+
+	flag.Parse()
+
+	return Config{
+		debug:       *ptrDebug,
+		broker_conn: *ptrBrokerConn,
+		mqtt_topic:  *ptrMqttTopic,
+		db_filename: *ptrDbFilename,
+		chunk_size:  *ptrChunkSize,
+		verbose:     *ptrVerbose,
+	}
+}
+
+func sqliteOpenAndCreate(filename string) {
 	var err error
-	db, err = sql.Open("sqlite3", databaseFilename)
+	db, err = sql.Open("sqlite3", filename)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -107,7 +154,7 @@ func sqliteOpenAndCreate() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("Database opened")
+	log.Println("Database ready")
 }
 
 func sqliteClose() {
@@ -116,6 +163,8 @@ func sqliteClose() {
 }
 
 func sqliteBufferWrite() {
+	/// fmt.Print("<#")
+
 	transaction, err := db.Begin()
 	if err != nil {
 		log.Fatal(err)
@@ -145,11 +194,13 @@ loop:
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	/// fmt.Print("#>")
 }
 
 func writeWaitLoop() {
-	defer time.AfterFunc(1000*time.Millisecond, writeWaitLoop)
-	if len(writeBuffer) >= 100 {
+	defer time.AfterFunc(512*time.Millisecond, writeWaitLoop)
+	if len(writeBuffer) >= int(conf.chunk_size) {
 		sqliteBufferWrite()
 	}
 }
@@ -179,31 +230,49 @@ func messageHandler(c paho.Client, msg paho.Message) {
 }
 
 func connLostHandler(c paho.Client, e error) {
-	log.Println("Connection lost")
+	log.Println("Client connection lost")
 	log.Println(e)
 }
 
+/* Default publish handler is called when client receives messages,
+ * but there is no handler registered. Such situation may occur e.g.
+ * when program is closing.
+ */
 func defPublishHandler(c paho.Client, m paho.Message) {
-	log.Println("Default publish handler called")
-	log.Printf("%+v\n", m)
+	/// log.Printf("%+v\n", m)
+	return
 }
 
 func onConnectHandler(c paho.Client) {
 	log.Println("Client connected")
 }
 
+/* Catch SIGTERM or SIGINT and tidy up before exiting.
+ */
+func exitHandler(client paho.Client) {
+	exitChannel := make(chan os.Signal, 1)
+	signal.Notify(exitChannel, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-exitChannel
+
+		log.Println("Disconnecting client")
+		client.Unsubscribe(conf.mqtt_topic)
+		client.Disconnect(0)
+
+		log.Println("Flushing write buffer to database")
+		sqliteBufferWrite()
+		sqliteClose()
+		os.Exit(0)
+	}()
+}
+
 func main() {
-	defer sqliteClose()
-
-	const TOPIC = "/hfp/#"
-	/// "/hfp/journey/rail/#"
-	/// "/hfp/journey/tram/0040_00409/#"
-
 	opts := paho.NewClientOptions()
 	opts = opts.SetConnectionLostHandler(connLostHandler)
 	opts = opts.SetDefaultPublishHandler(defPublishHandler)
 	opts = opts.SetOnConnectHandler(onConnectHandler)
-	opts = opts.AddBroker("tcp://mqtt.hsl.fi:1883")
+	opts = opts.AddBroker(conf.broker_conn)
 	client := paho.NewClient(opts)
 
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
@@ -211,11 +280,13 @@ func main() {
 		log.Println(token.Error())
 	}
 
-	token := client.Subscribe(TOPIC, 0, messageHandler)
+	token := client.Subscribe(conf.mqtt_topic, 0, messageHandler)
 	if token.Wait() && token.Error() != nil {
 		log.Println("Token error")
 		log.Println(token.Error())
 	}
+
+	exitHandler(client)
 
 	select {}
 }
