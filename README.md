@@ -1,5 +1,5 @@
 
-![matta](matta.png)
+![matta](logo/matta.png)
 
 # matta
 
