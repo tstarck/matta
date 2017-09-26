@@ -1,21 +1,16 @@
 // matta, Copyright (c) 2017 Tuomas Starck
 /* TODO
  *  refactor sql to another file
- *  should erroneous hfp message be saved?
- *  method to report write interval
- *  method to report messages per write
- *  count how many msgs/sec we get at the moment
- *
- *  tcp://mqtt.hsl.fi:1883
- *  "/hfp/journey/rail/#"
- *  "/hfp/journey/tram/0040_00409/#"
+ *  make a cool queues for:
+ *   errors (unexpected msgs format, et al)
+ *   status (write interval, msgs/write, msgs/sec, et al)
  */
 
 package main
 
 import (
 	"database/sql"
-	"encoding/json"
+	/// "encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -48,6 +43,7 @@ type QueueMsg struct {
 	data  string
 }
 
+/*
 type HFPMsg struct {
 	VP struct {
 		Desi       string  // "I",
@@ -68,6 +64,7 @@ type HFPMsg struct {
 		Source     string  // "sm5logger"
 	}
 }
+*/
 
 const (
 	usageDebug      = "Print out all debug messages"
@@ -206,13 +203,13 @@ func writeWaitLoop() {
 }
 
 func messageHandler(c paho.Client, msg paho.Message) {
-	var hfp HFPMsg
+	/// var hfp HFPMsg
 
-	if err := json.Unmarshal(msg.Payload(), &hfp); err != nil {
+	/* if err := json.Unmarshal(msg.Payload(), &hfp); err != nil {
 		log.Println(msg.Topic())
 		log.Println(string(msg.Payload()))
 		log.Println(err)
-	}
+	} */
 
 	writeBuffer <- QueueMsg{
 		at:    time.Now(),
